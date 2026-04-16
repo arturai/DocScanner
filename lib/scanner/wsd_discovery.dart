@@ -59,10 +59,62 @@ class WsdDiscovery {
         }
       });
 
-      return completer.future;
+      final results = await completer.future;
+
+      // Fetch device model names via WS-Transfer Get metadata
+      for (int i = 0; i < results.length; i++) {
+        final modelName = await _fetchModelName(results[i].xAddrs);
+        if (modelName != null) {
+          results[i] = DiscoveredScanner(
+            address: results[i].address,
+            xAddrs: results[i].xAddrs,
+            name: modelName,
+            rawResponse: results[i].rawResponse,
+          );
+        }
+      }
+
+      return results;
     } catch (e) {
       socket?.close();
       rethrow;
+    }
+  }
+
+  /// Fetch the device model name via WS-Transfer Get metadata request.
+  static Future<String?> _fetchModelName(String xAddrs) async {
+    final uri = Uri.parse(xAddrs);
+    final envelope = '''<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope
+  xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+  xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing">
+  <soap:Header>
+    <wsa:To>$xAddrs</wsa:To>
+    <wsa:Action>http://schemas.xmlsoap.org/ws/2004/09/transfer/Get</wsa:Action>
+    <wsa:MessageID>urn:uuid:${_generateUuid()}</wsa:MessageID>
+    <wsa:ReplyTo>
+      <wsa:Address>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:Address>
+    </wsa:ReplyTo>
+  </soap:Header>
+  <soap:Body/>
+</soap:Envelope>''';
+
+    final client = HttpClient();
+    client.connectionTimeout = const Duration(seconds: 3);
+    try {
+      final request = await client.postUrl(uri);
+      request.headers.set('Content-Type',
+          'application/soap+xml; charset=utf-8; action="http://schemas.xmlsoap.org/ws/2004/09/transfer/Get"');
+      request.write(envelope);
+      final response = await request.close();
+      final body = await response.transform(const SystemEncoding().decoder).join();
+
+      final match = RegExp(r'<[^>]*ModelName[^>]*>(.*?)</[^>]*ModelName>', dotAll: true).firstMatch(body);
+      return match?.group(1)?.trim();
+    } catch (_) {
+      return null;
+    } finally {
+      client.close();
     }
   }
 

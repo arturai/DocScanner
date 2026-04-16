@@ -2,6 +2,8 @@ import 'dart:io';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../scanner/pdf_builder.dart';
 import '../scanner/scan_document.dart';
@@ -24,6 +26,8 @@ class _HomePageState extends State<HomePage> {
   bool _isSaving = false;
   String? _error;
   String? _statusMessage;
+  String? _lastSaveDir;
+  String? _defaultSaveDir;
 
   // Document state
   final ScanDocument _document = ScanDocument();
@@ -35,10 +39,34 @@ class _HomePageState extends State<HomePage> {
   String _inputSource = 'Platen';
   bool _saveAsPdf = true;
 
+  static const _kDefaultSaveDir = 'default_save_dir';
+
   @override
   void initState() {
     super.initState();
+    _loadPreferences();
     _discoverScanners();
+  }
+
+  Future<void> _loadPreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _defaultSaveDir = prefs.getString(_kDefaultSaveDir);
+    });
+  }
+
+  Future<void> _pickDefaultSaveDir() async {
+    final dir = await getDirectoryPath(
+      initialDirectory: _defaultSaveDir ?? _fallbackSaveDir(),
+    );
+    if (dir != null) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kDefaultSaveDir, dir);
+      setState(() {
+        _defaultSaveDir = dir;
+        _statusMessage = 'Default save folder: $dir';
+      });
+    }
   }
 
   Future<void> _discoverScanners() async {
@@ -113,9 +141,7 @@ class _HomePageState extends State<HomePage> {
         _document.addPage(imageBytes);
         _selectedPageIndex = _document.pageCount - 1;
         _isScanning = false;
-        _statusMessage =
-            'Page ${_document.pageCount} scanned (${(imageBytes.length / 1024).toStringAsFixed(0)} KB) '
-            '[${wsd.lastDiagnostics}]';
+        _statusMessage = 'Page ${_document.pageCount} scanned (${(imageBytes.length / 1024).toStringAsFixed(0)} KB)';
       });
     } catch (e) {
       setState(() {
@@ -145,12 +171,14 @@ class _HomePageState extends State<HomePage> {
           acceptedTypeGroups: [
             const XTypeGroup(label: 'PDF', extensions: ['pdf']),
           ],
-          initialDirectory: _defaultSaveDir(),
+          initialDirectory: _getSaveDir(),
         );
 
         if (location != null) {
           await File(location.path).writeAsBytes(pdfBytes);
+          final dir = File(location.path).parent.path;
           setState(() {
+            _lastSaveDir = dir;
             _statusMessage = 'Saved ${_document.pageCount} page(s) to ${location.path}';
           });
         }
@@ -163,11 +191,12 @@ class _HomePageState extends State<HomePage> {
             acceptedTypeGroups: [
               const XTypeGroup(label: 'JPEG', extensions: ['jpg', 'jpeg']),
             ],
-            initialDirectory: _defaultSaveDir(),
+            initialDirectory: _getSaveDir(),
           );
 
           if (location != null) {
             await File(location.path).writeAsBytes(_document.pages[i].imageBytes);
+            _lastSaveDir = File(location.path).parent.path;
             saved++;
           } else {
             break; // User cancelled
@@ -190,7 +219,11 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  String _defaultSaveDir() {
+  String _getSaveDir() {
+    return _defaultSaveDir ?? _fallbackSaveDir();
+  }
+
+  String _fallbackSaveDir() {
     final home = Platform.environment['HOME'] ?? '/tmp';
     return '$home/Documents';
   }
@@ -326,6 +359,15 @@ class _HomePageState extends State<HomePage> {
             value: _saveAsPdf,
             onChanged: (v) => setState(() => _saveAsPdf = v),
           ),
+          ListTile(
+            leading: const Icon(Icons.folder, size: 20),
+            title: const Text('Save Folder'),
+            subtitle: Text(
+              _defaultSaveDir ?? 'Documents (default)',
+              overflow: TextOverflow.ellipsis,
+            ),
+            onTap: _pickDefaultSaveDir,
+          ),
         ],
 
         const Spacer(),
@@ -391,6 +433,14 @@ class _HomePageState extends State<HomePage> {
                   icon: const Icon(Icons.delete_outline),
                   label: const Text('Clear All'),
                   onPressed: _clearDocument,
+                ),
+              ],
+              if (_lastSaveDir != null) ...[
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.folder_open),
+                  label: const Text('Open Folder'),
+                  onPressed: () => launchUrl(Uri.directory(_lastSaveDir!)),
                 ),
               ],
             ],
