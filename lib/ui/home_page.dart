@@ -114,7 +114,8 @@ class _HomePageState extends State<HomePage> {
         _selectedPageIndex = _document.pageCount - 1;
         _isScanning = false;
         _statusMessage =
-            'Page ${_document.pageCount} scanned (${(imageBytes.length / 1024).toStringAsFixed(0)} KB)';
+            'Page ${_document.pageCount} scanned (${(imageBytes.length / 1024).toStringAsFixed(0)} KB) '
+            '[${wsd.lastDiagnostics}]';
       });
     } catch (e) {
       setState(() {

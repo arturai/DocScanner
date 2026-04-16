@@ -46,6 +46,12 @@ class WsdScanner {
   Future<Uint8List> scan({
     ScanSettings settings = const ScanSettings(),
   }) async {
+    // BlackAndWhite1 with exif format produces G3FAX data (not real JPEG).
+    // Use Grayscale8 instead — the scanner produces a standard JPEG.
+    final effectiveColorMode = settings.colorMode == 'BlackAndWhite1'
+        ? 'Grayscale8'
+        : settings.colorMode;
+
     // Step 1: CreateScanJob — must match the Brother's expected ScanTicket format
     final createResponse = await _soapRequest(
       action: 'http://schemas.microsoft.com/windows/2006/08/wdp/scan/CreateScanJob',
@@ -89,7 +95,7 @@ class WsdScanner {
                 <wscn:ScanRegionWidth>${settings.widthInThousandths}</wscn:ScanRegionWidth>
                 <wscn:ScanRegionHeight>${settings.heightInThousandths}</wscn:ScanRegionHeight>
               </wscn:ScanRegion>
-              <wscn:ColorProcessing>${settings.colorMode}</wscn:ColorProcessing>
+              <wscn:ColorProcessing>$effectiveColorMode</wscn:ColorProcessing>
               <wscn:Resolution>
                 <wscn:Width>${settings.dpi}</wscn:Width>
                 <wscn:Height>${settings.dpi}</wscn:Height>
@@ -161,13 +167,23 @@ $body
       request.write(envelope);
       final response = await request.close();
 
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        final errorBody = await response.transform(const SystemEncoding().decoder).join();
+        final truncated = errorBody.length > 500 ? '${errorBody.substring(0, 500)}...' : errorBody;
+        throw ScanException('HTTP ${response.statusCode}: $truncated');
+      }
+
       if (returnRawBytes) {
         final contentType = response.headers.value('content-type');
         final bytes = await response.fold<List<int>>(
           [],
           (previous, element) => previous..addAll(element),
         );
-        return _SoapRawResponse(Uint8List.fromList(bytes), contentType);
+        final result = Uint8List.fromList(bytes);
+        _lastDiag = 'HTTP ${response.statusCode}, '
+            'Content-Type: ${contentType ?? "null"}, '
+            '${result.length} bytes';
+        return _SoapRawResponse(result, contentType);
       } else {
         return await response.transform(const SystemEncoding().decoder).join();
       }
@@ -175,6 +191,10 @@ $body
       client.close();
     }
   }
+
+  /// Diagnostic info from the last raw request, exposed for UI debugging.
+  String _lastDiag = '';
+  String get lastDiagnostics => _lastDiag;
 
   /// Parse the MIME boundary string from a Content-Type header.
   String? _parseBoundary(String? contentType) {
@@ -189,32 +209,76 @@ $body
   /// everything up to the closing MIME boundary.
   Uint8List _extractMtomBinary(_SoapRawResponse response) {
     final bytes = response.bodyBytes;
-    final boundary = _parseBoundary(response.contentType);
+    final contentType = response.contentType ?? '';
+
+    // Verify this is actually a multipart MTOM response
+    if (!contentType.toLowerCase().contains('multipart')) {
+      // Not multipart — likely a SOAP fault. Try to extract error message.
+      final text = utf8.decode(bytes, allowMalformed: true);
+      final fault = _extractTag(text, 'Reason') ?? _extractTag(text, 'Fault');
+      throw ScanException(
+        'Scanner returned non-multipart response '
+        '(Content-Type: $contentType, ${bytes.length} bytes). '
+        '${fault != null ? "Fault: $fault" : "Raw: ${text.substring(0, text.length.clamp(0, 300))}"}',
+      );
+    }
+
+    final boundary = _parseBoundary(contentType);
     Uint8List? boundaryBytes;
     if (boundary != null) {
-      // MIME boundaries are preceded by \r\n-- in the body
       boundaryBytes = utf8.encode('\r\n--$boundary');
     }
 
     // Find JPEG/EXIF header (FF D8 FF) or TIFF header
+    int imageOffset = -1;
     for (int i = 0; i < bytes.length - 4; i++) {
-      // JPEG magic: FF D8 FF
       if (bytes[i] == 0xFF && bytes[i + 1] == 0xD8 && bytes[i + 2] == 0xFF) {
-        return _extractUntilBoundary(bytes, i, boundaryBytes: boundaryBytes);
+        imageOffset = i;
+        break;
       }
-      // TIFF LE: 49 49 2A 00
       if (bytes[i] == 0x49 && bytes[i + 1] == 0x49 && bytes[i + 2] == 0x2A && bytes[i + 3] == 0x00) {
-        return _extractUntilBoundary(bytes, i, boundaryBytes: boundaryBytes);
+        imageOffset = i;
+        break;
       }
-      // TIFF BE: 4D 4D 00 2A
       if (bytes[i] == 0x4D && bytes[i + 1] == 0x4D && bytes[i + 2] == 0x00 && bytes[i + 3] == 0x2A) {
-        return _extractUntilBoundary(bytes, i, boundaryBytes: boundaryBytes);
+        imageOffset = i;
+        break;
       }
     }
 
-    throw ScanException('Could not find image data in MTOM response (${bytes.length} bytes)');
+    if (imageOffset < 0) {
+      throw ScanException(
+        'No image header found in MTOM response '
+        '(${bytes.length} bytes, boundary: $boundary)',
+      );
+    }
+
+    final extracted = _extractUntilBoundary(bytes, imageOffset, boundaryBytes: boundaryBytes);
+
+    // Update diagnostics
+    _lastDiag += ', boundary: ${boundary ?? "none"}, '
+        'image@$imageOffset, extracted: ${extracted.length} bytes';
+
+    // Validate: extracted data must start with a known image header
+    if (extracted.length < 1024) {
+      throw ScanException(
+        'Extracted image too small (${extracted.length} bytes). '
+        'Response was ${bytes.length} bytes. $_lastDiag',
+      );
+    }
+    if (extracted[0] != 0xFF || extracted[1] != 0xD8) {
+      final header = extracted.take(8).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+      throw ScanException(
+        'Extracted data does not start with valid image header: $header. '
+        '$_lastDiag',
+      );
+    }
+
+    return extracted;
   }
 
+  /// Extract bytes from [start] to the next MIME boundary.
+  /// Returns a COPY (not a view) to avoid memory lifecycle issues.
   Uint8List _extractUntilBoundary(Uint8List bytes, int start, {Uint8List? boundaryBytes}) {
     // If we have the real boundary from Content-Type, search for it exactly
     if (boundaryBytes != null) {
@@ -227,7 +291,7 @@ $body
           }
         }
         if (match) {
-          return Uint8List.sublistView(bytes, start, i);
+          return bytes.sublist(start, i);
         }
       }
     }
@@ -236,12 +300,12 @@ $body
     for (int i = bytes.length - 1; i > start + 4; i--) {
       if (bytes[i] == 0x2D && bytes[i - 1] == 0x2D &&
           bytes[i - 2] == 0x0A && bytes[i - 3] == 0x0D) {
-        return Uint8List.sublistView(bytes, start, i - 3);
+        return bytes.sublist(start, i - 3);
       }
     }
 
     // No boundary found — return everything from image header to end
-    return Uint8List.sublistView(bytes, start);
+    return bytes.sublist(start);
   }
 
   String? _extractTag(String xml, String tagName) {
