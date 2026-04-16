@@ -1,0 +1,21 @@
+# Conversation logs
+conversation_xcode.md
+
+# Flutter/Dart
+*.dart_tool/
+.packages
+.pub/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# macOS
+*.xcuserdata
+*.xcworkspace/xcuserdata/
+.DS_Store
+**/.DS_Store
