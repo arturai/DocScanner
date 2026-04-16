@@ -1,7 +1,14 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'wsd_discovery.dart';
+
+class _SoapRawResponse {
+  final Uint8List bodyBytes;
+  final String? contentType;
+  _SoapRawResponse(this.bodyBytes, this.contentType);
+}
 
 /// Performs scanning operations via WS-Scan (WSD) protocol.
 ///
@@ -119,7 +126,7 @@ class WsdScanner {
     );
 
     // The response is MTOM/XOP — extract binary image from multipart MIME
-    return _extractMtomBinary(imageResponse);
+    return _extractMtomBinary(imageResponse as _SoapRawResponse);
   }
 
   /// Send a SOAP request and return the response body.
@@ -155,11 +162,12 @@ $body
       final response = await request.close();
 
       if (returnRawBytes) {
+        final contentType = response.headers.value('content-type');
         final bytes = await response.fold<List<int>>(
           [],
           (previous, element) => previous..addAll(element),
         );
-        return Uint8List.fromList(bytes);
+        return _SoapRawResponse(Uint8List.fromList(bytes), contentType);
       } else {
         return await response.transform(const SystemEncoding().decoder).join();
       }
@@ -168,47 +176,70 @@ $body
     }
   }
 
+  /// Parse the MIME boundary string from a Content-Type header.
+  String? _parseBoundary(String? contentType) {
+    if (contentType == null) return null;
+    final match = RegExp(r'boundary="?([^";]+)"?').firstMatch(contentType);
+    return match?.group(1);
+  }
+
   /// Extract image bytes from an MTOM/XOP multipart MIME response.
   /// The Brother returns multipart/related with a SOAP XML part followed
   /// by a binary image part. We find the JPEG header (FF D8 FF) and extract
   /// everything up to the closing MIME boundary.
-  Uint8List _extractMtomBinary(dynamic responseBytes) {
-    if (responseBytes is! Uint8List) {
-      throw ScanException('Expected raw bytes for MTOM response');
+  Uint8List _extractMtomBinary(_SoapRawResponse response) {
+    final bytes = response.bodyBytes;
+    final boundary = _parseBoundary(response.contentType);
+    Uint8List? boundaryBytes;
+    if (boundary != null) {
+      // MIME boundaries are preceded by \r\n-- in the body
+      boundaryBytes = utf8.encode('\r\n--$boundary');
     }
-
-    final bytes = responseBytes;
 
     // Find JPEG/EXIF header (FF D8 FF) or TIFF header
     for (int i = 0; i < bytes.length - 4; i++) {
       // JPEG magic: FF D8 FF
       if (bytes[i] == 0xFF && bytes[i + 1] == 0xD8 && bytes[i + 2] == 0xFF) {
-        return _extractUntilBoundary(bytes, i);
+        return _extractUntilBoundary(bytes, i, boundaryBytes: boundaryBytes);
       }
       // TIFF LE: 49 49 2A 00
       if (bytes[i] == 0x49 && bytes[i + 1] == 0x49 && bytes[i + 2] == 0x2A && bytes[i + 3] == 0x00) {
-        return _extractUntilBoundary(bytes, i);
+        return _extractUntilBoundary(bytes, i, boundaryBytes: boundaryBytes);
       }
       // TIFF BE: 4D 4D 00 2A
       if (bytes[i] == 0x4D && bytes[i + 1] == 0x4D && bytes[i + 2] == 0x00 && bytes[i + 3] == 0x2A) {
-        return _extractUntilBoundary(bytes, i);
+        return _extractUntilBoundary(bytes, i, boundaryBytes: boundaryBytes);
       }
     }
 
     throw ScanException('Could not find image data in MTOM response (${bytes.length} bytes)');
   }
 
-  Uint8List _extractUntilBoundary(Uint8List bytes, int start) {
-    // Find the closing MIME boundary: \r\n--<boundary>--
-    // Scan backwards from the end for \r\n--
+  Uint8List _extractUntilBoundary(Uint8List bytes, int start, {Uint8List? boundaryBytes}) {
+    // If we have the real boundary from Content-Type, search for it exactly
+    if (boundaryBytes != null) {
+      for (int i = start; i <= bytes.length - boundaryBytes.length; i++) {
+        bool match = true;
+        for (int j = 0; j < boundaryBytes.length; j++) {
+          if (bytes[i + j] != boundaryBytes[j]) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
+          return Uint8List.sublistView(bytes, start, i);
+        }
+      }
+    }
+
+    // Fallback: scan backwards from the end for \r\n--
     for (int i = bytes.length - 1; i > start + 4; i--) {
       if (bytes[i] == 0x2D && bytes[i - 1] == 0x2D &&
           bytes[i - 2] == 0x0A && bytes[i - 3] == 0x0D) {
-        // Found \r\n--, walk back to the \r\n before the boundary
-        int end = i - 3;
-        return Uint8List.sublistView(bytes, start, end);
+        return Uint8List.sublistView(bytes, start, i - 3);
       }
     }
+
     // No boundary found — return everything from image header to end
     return Uint8List.sublistView(bytes, start);
   }
