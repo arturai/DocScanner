@@ -514,11 +514,15 @@ class ScannerCapabilities {
     if (xml.contains('<wscn:Platen>')) sources.add('Platen');
     if (xml.contains('<wscn:ADF>')) sources.add('ADF');
 
-    // Duplex support is advertised by the VALUE of ADFSupportsDuplex (0/1) —
-    // the element (and an ADFBack config block) is present even on simplex ADFs.
+    // Duplex support: the device may report ADFSupportsDuplex=1, OR advertise a
+    // back-side sensor via an <wscn:ADFBack> block with its own optical
+    // resolution (real duplex hardware). Some Brother firmware reports
+    // ADFSupportsDuplex=0 even though the ADFBack CIS exists, so trust either.
     final duplexMatch =
         RegExp(r'<wscn:ADFSupportsDuplex>\s*(\d)\s*</wscn:ADFSupportsDuplex>').firstMatch(xml);
-    final supportsDuplex = duplexMatch?.group(1) == '1';
+    final hasBackSensor =
+        RegExp(r'<wscn:ADFBack>.*<wscn:ADFOpticalResolution>', dotAll: true).hasMatch(xml);
+    final supportsDuplex = duplexMatch?.group(1) == '1' || hasBackSensor;
 
     // Parse status
     final status = RegExp(r'<wscn:ScannerState>(.*?)</wscn:ScannerState>').firstMatch(xml)?.group(1) ?? 'Unknown';

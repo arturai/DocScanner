@@ -1,10 +1,12 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../scanner/brother_native_scanner.dart';
 import '../scanner/pdf_builder.dart';
 import '../scanner/scan_document.dart';
 import '../scanner/wsd_discovery.dart';
@@ -133,15 +135,22 @@ class _HomePageState extends State<HomePage> {
     });
 
     try {
-      final wsd = WsdScanner(_selectedScanner!);
-      final images = await wsd.scan(
-        settings: ScanSettings(
-          dpi: _dpi,
-          colorMode: _colorMode,
-          inputSource: _inputSource,
-          duplex: _inputSource == 'ADF' && _duplex,
-        ),
-      );
+      final List<Uint8List> images;
+      if (_inputSource == 'ADF' && _duplex) {
+        // Two-sided ADF isn't reachable over WSD on this device — use Brother's
+        // proprietary protocol (TCP 54921) for the duplex path only.
+        final brother = BrotherNativeScanner(_selectedScanner!.address);
+        images = await brother.scanDuplex(dpi: _dpi);
+      } else {
+        final wsd = WsdScanner(_selectedScanner!);
+        images = await wsd.scan(
+          settings: ScanSettings(
+            dpi: _dpi,
+            colorMode: _colorMode,
+            inputSource: _inputSource,
+          ),
+        );
+      }
 
       setState(() {
         for (final bytes in images) {
