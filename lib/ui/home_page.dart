@@ -37,6 +37,7 @@ class _HomePageState extends State<HomePage> {
   int _dpi = 300;
   String _colorMode = 'RGB24';
   String _inputSource = 'Platen';
+  bool _duplex = false; // two-sided scanning (ADF only)
   bool _saveAsPdf = true;
 
   static const _kDefaultSaveDir = 'default_save_dir';
@@ -106,8 +107,12 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         _capabilities = caps;
         _dpi = caps.supportedResolutions.contains(300) ? 300 : caps.supportedResolutions.first;
-        _colorMode = caps.supportedColorModes.first;
+        // Default to Color when the scanner supports it.
+        _colorMode = caps.supportedColorModes.contains('RGB24')
+            ? 'RGB24'
+            : caps.supportedColorModes.first;
         _inputSource = caps.supportedInputSources.first;
+        _duplex = false;
         _statusMessage = 'Scanner ready (${caps.statusText})';
       });
     } catch (e) {
@@ -129,27 +134,59 @@ class _HomePageState extends State<HomePage> {
 
     try {
       final wsd = WsdScanner(_selectedScanner!);
-      final imageBytes = await wsd.scan(
+      final images = await wsd.scan(
         settings: ScanSettings(
           dpi: _dpi,
           colorMode: _colorMode,
           inputSource: _inputSource,
+          duplex: _inputSource == 'ADF' && _duplex,
         ),
       );
 
       setState(() {
-        _document.addPage(imageBytes);
+        for (final bytes in images) {
+          _document.addPage(bytes);
+        }
         _selectedPageIndex = _document.pageCount - 1;
         _isScanning = false;
-        _statusMessage = 'Page ${_document.pageCount} scanned (${(imageBytes.length / 1024).toStringAsFixed(0)} KB)';
+        _statusMessage = images.length == 1
+            ? 'Page ${_document.pageCount} scanned (${(images.first.length / 1024).toStringAsFixed(0)} KB)'
+            : '${images.length} pages scanned — ${_document.pageCount} total';
       });
     } catch (e) {
       setState(() {
         _isScanning = false;
-        _error = 'Scan failed: $e';
+        _error = _friendlyScanError(e);
         _statusMessage = null;
       });
     }
+  }
+
+  /// Turn a scan exception into an actionable message. Known WSD fault subcodes
+  /// get a plain-language hint; the raw detail is always appended for reference.
+  String _friendlyScanError(Object e) {
+    final subcode = e is ScanException ? e.faultSubcode ?? '' : '';
+    final lower = subcode.toLowerCase();
+    String? hint;
+    if (lower.contains('noimagesavailable')) {
+      hint = _inputSource == 'ADF'
+          ? 'The document feeder appears to be empty — load pages into the top feeder and try again.'
+          : 'No image was available to scan.';
+    } else if (lower.contains('notacceptingjobs')) {
+      hint = _inputSource == 'ADF'
+          ? 'The scanner would not start the job. Make sure paper is loaded in the top '
+              'document feeder (and no other scan is in progress), then try again.'
+          : 'The scanner would not accept the scan job. Make sure no other scan is in '
+              'progress and the settings are supported, then try again.';
+    } else if (lower.contains('formatnotsupported')) {
+      hint = 'The scanner does not support the requested image format.';
+    } else if (lower.contains('invalidargs')) {
+      hint = 'The scanner rejected one of the scan settings.';
+    } else if (lower.contains('jobidnotfound')) {
+      hint = 'The scan job ended before any page was received. Make sure a page is '
+          'in place and try again.';
+    }
+    return hint != null ? '$hint\n\n$e' : 'Scan failed: $e';
   }
 
   Future<void> _saveDocument() async {
@@ -275,6 +312,12 @@ class _HomePageState extends State<HomePage> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        // Scrollable settings area so a tall sidebar never clips the buttons.
+        Expanded(
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
         // Scanner selection
         Padding(
           padding: const EdgeInsets.all(16),
@@ -346,6 +389,24 @@ class _HomePageState extends State<HomePage> {
                       .toList(),
                   onChanged: (v) => setState(() => _inputSource = v ?? 'Platen'),
                 ),
+                // Sides (duplex) applies only to the automatic document feeder;
+                // always shown, but disabled (greyed out) for the flatbed or when
+                // the device's ADF is simplex-only (no two-sided hardware).
+                const SizedBox(height: 12),
+                Builder(builder: (context) {
+                  final canDuplex = _capabilities!.supportsDuplex;
+                  return DropdownButtonFormField<bool>(
+                    decoration: const InputDecoration(labelText: 'Sides', border: OutlineInputBorder()),
+                    initialValue: canDuplex && _duplex,
+                    items: [
+                      const DropdownMenuItem(value: false, child: Text('1-Sided')),
+                      if (canDuplex) const DropdownMenuItem(value: true, child: Text('2-Sided')),
+                    ],
+                    onChanged: _inputSource == 'ADF' && canDuplex
+                        ? (v) => setState(() => _duplex = v ?? false)
+                        : null,
+                  );
+                }),
               ],
             ),
           ),
@@ -370,22 +431,13 @@ class _HomePageState extends State<HomePage> {
           ),
         ],
 
-        const Spacer(),
-
-        // Status / error bar
-        if (_error != null)
-          Expanded(
-            child: Container(
-              padding: const EdgeInsets.all(12),
-              color: Theme.of(context).colorScheme.errorContainer,
-              child: SingleChildScrollView(
-                child: SelectableText(
-                  _error!,
-                  style: TextStyle(color: Theme.of(context).colorScheme.onErrorContainer, fontSize: 11),
-                ),
-              ),
+              ],
             ),
           ),
+        ),
+
+        // Short status line stays in the sidebar; full errors render in the
+        // main panel (see _buildPreview) where there's room to show them.
         if (_statusMessage != null && _error == null)
           Container(
             padding: const EdgeInsets.all(12),
@@ -473,6 +525,56 @@ class _HomePageState extends State<HomePage> {
             SizedBox(height: 16),
             Text('Scanning page...', style: TextStyle(fontSize: 16)),
           ],
+        ),
+      );
+    }
+
+    // Errors take the whole panel so the full message is always readable
+    // without resizing the window.
+    if (_error != null) {
+      final scheme = Theme.of(context).colorScheme;
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 640),
+            child: Container(
+              padding: const EdgeInsets.all(24),
+              decoration: BoxDecoration(
+                color: scheme.errorContainer,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(Icons.error_outline, color: scheme.onErrorContainer),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Scan failed',
+                        style: TextStyle(
+                          color: scheme.onErrorContainer,
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Flexible(
+                    child: SingleChildScrollView(
+                      child: SelectableText(
+                        _error!,
+                        style: TextStyle(color: scheme.onErrorContainer, fontSize: 13),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
         ),
       );
     }

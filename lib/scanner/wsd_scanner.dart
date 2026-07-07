@@ -4,6 +4,26 @@ import 'dart:typed_data';
 
 import 'wsd_discovery.dart';
 
+/// When true, the full WSD protocol exchange (requests, responses, faults) is
+/// logged to stderr and to a file in the temp dir for inspection. Diagnostic aid
+/// for aligning our ScanTicket with what the device's DefaultScanTicket expects;
+/// flip to true when debugging scanner communication.
+const bool kLogWsdProtocol = false;
+
+void _logWsd(String label, String content) {
+  if (!kLogWsdProtocol) return;
+  final block = '\n===== WSD $label =====\n$content\n===== end $label =====\n';
+  stderr.writeln(block);
+  // The macOS app is sandboxed and its stderr isn't easily captured, so also
+  // append to a file inside the sandbox container's temp dir for inspection.
+  try {
+    final f = File('${Directory.systemTemp.path}/docscanner_wsd_debug.log');
+    f.writeAsStringSync(block, mode: FileMode.append, flush: true);
+  } catch (_) {
+    // best-effort diagnostics only
+  }
+}
+
 class _SoapRawResponse {
   final Uint8List bodyBytes;
   final String? contentType;
@@ -39,11 +59,21 @@ class WsdScanner {
     </wscn:GetScannerElementsRequest>''',
     );
 
+    _logWsd('GetScannerElements RESPONSE (ScannerConfiguration + DefaultScanTicket)', response.toString());
+
     return ScannerCapabilities.fromSoapResponse(response);
   }
 
-  /// Start a scan job and return the scanned image bytes (JPEG).
-  Future<Uint8List> scan({
+  /// Start a scan and return the scanned page images (JPEG bytes).
+  ///
+  /// For the flatbed (Platen) this returns a single page. For the automatic
+  /// document feeder (ADF) it scans one sheet per job and repeats until the
+  /// feeder is empty, returning every sheet.
+  ///
+  /// The Brother firmware rejects `ImagesToTransfer=0` ("scan all") outright, so
+  /// the ADF job requests a large per-job image cap and pages are pulled with
+  /// repeated RetrieveImage calls until the feeder reports it is exhausted.
+  Future<List<Uint8List>> scan({
     ScanSettings settings = const ScanSettings(),
   }) async {
     // BlackAndWhite1 with exif format produces G3FAX data (not real JPEG).
@@ -52,10 +82,19 @@ class WsdScanner {
         ? 'Grayscale8'
         : settings.colorMode;
 
-    // Step 1: CreateScanJob — must match the Brother's expected ScanTicket format
-    final createResponse = await _soapRequest(
-      action: 'http://schemas.microsoft.com/windows/2006/08/wdp/scan/CreateScanJob',
-      body: '''
+    final isAdf = settings.inputSource == 'ADF';
+    // Two-sided ADF is a distinct InputSource value (ADFDuplex), NOT ADF plus a
+    // MediaBack block. See WS-Scan spec: InputSource ∈ {Platen, ADF, ADFDuplex}.
+    final effectiveSource = isAdf && settings.duplex ? 'ADFDuplex' : settings.inputSource;
+
+    // ImagesToTransfer is a hard per-job image cap on this Brother firmware.
+    // 0 ("all") is rejected outright, and 1 caps the job at a single page. The
+    // ADF feeds the whole stack under one job, so request a large count and stop
+    // when the feeder is exhausted (JobIdNotFound / NoImagesAvailable). Platen
+    // scans exactly one page.
+    final imagesToTransfer = isAdf ? 999 : 1;
+
+    final ticket = '''
     <wscn:CreateScanJobRequest xmlns:wscn="http://schemas.microsoft.com/windows/2006/08/wdp/scan">
       <wscn:ScanTicket>
         <wscn:JobDescription>
@@ -66,8 +105,8 @@ class WsdScanner {
         <wscn:DocumentParameters>
           <wscn:Format>${settings.format}</wscn:Format>
           <wscn:CompressionQualityFactor>100</wscn:CompressionQualityFactor>
-          <wscn:ImagesToTransfer>1</wscn:ImagesToTransfer>
-          <wscn:InputSource>${settings.inputSource}</wscn:InputSource>
+          <wscn:ImagesToTransfer>$imagesToTransfer</wscn:ImagesToTransfer>
+          <wscn:InputSource>$effectiveSource</wscn:InputSource>
           <wscn:ContentType>Auto</wscn:ContentType>
           <wscn:InputSize>
             <wscn:InputMediaSize>
@@ -104,20 +143,49 @@ class WsdScanner {
           </wscn:MediaSides>
         </wscn:DocumentParameters>
       </wscn:ScanTicket>
-    </wscn:CreateScanJobRequest>''',
+    </wscn:CreateScanJobRequest>''';
+
+    // One CreateScanJob covers the whole batch: the device scans the entire ADF
+    // stack into a single job and holds each page for a separate RetrieveImage.
+    // We retrieve until the feeder is exhausted. (Creating a second job while the
+    // first is still delivering pages is what the Brother rejects.)
+    final createResponse = await _soapRequest(
+      action: 'http://schemas.microsoft.com/windows/2006/08/wdp/scan/CreateScanJob',
+      body: ticket,
     );
 
-    // Extract JobId from response
     final jobId = _extractTag(createResponse, 'JobId');
     if (jobId == null) {
       final preview = createResponse.toString();
       final truncated = preview.length > 500 ? '${preview.substring(0, 500)}...' : preview;
       throw ScanException('No JobId in response. Raw:\n$truncated');
     }
-
     final jobToken = _extractTag(createResponse, 'JobToken') ?? '';
 
-    // Step 2: RetrieveImage
+    const maxPages = 200; // safety cap against a misbehaving device
+    final pages = <Uint8List>[];
+
+    while (pages.length < maxPages) {
+      try {
+        pages.add(await _retrieveImage(jobId, jobToken));
+      } on ScanException catch (e) {
+        // Once we have pages, an "empty feeder" fault means the ADF is exhausted
+        // — normal completion. On the very first page it's a real error.
+        if (pages.isNotEmpty && _isFeederExhausted(e)) break;
+        rethrow;
+      }
+      if (!isAdf) break; // platen: single page
+    }
+
+    if (pages.isEmpty) {
+      throw ScanException('Scan produced no images.');
+    }
+
+    return pages;
+  }
+
+  /// Retrieve one page image from an active scan job.
+  Future<Uint8List> _retrieveImage(String jobId, String jobToken) async {
     final imageResponse = await _soapRequest(
       action: 'http://schemas.microsoft.com/windows/2006/08/wdp/scan/RetrieveImage',
       body: '''
@@ -133,6 +201,18 @@ class WsdScanner {
 
     // The response is MTOM/XOP — extract binary image from multipart MIME
     return _extractMtomBinary(imageResponse as _SoapRawResponse);
+  }
+
+  /// Whether a RetrieveImage fault means the batch is finished. After the last
+  /// fed sheet this Brother closes the job, so the next RetrieveImage returns
+  /// ClientErrorJobIdNotFound; the spec's ClientErrorNoImagesAvailable is the
+  /// empty-feeder signal. Either one means "no more pages", not a failure.
+  bool _isFeederExhausted(ScanException e) {
+    final haystack = '${e.faultSubcode ?? ''} ${e.message}'.toLowerCase();
+    return haystack.contains('noimagesavailable') ||
+        haystack.contains('jobidnotfound') ||
+        haystack.contains('nomoredocuments') ||
+        haystack.contains('endofdocuments');
   }
 
   /// Send a SOAP request and return the response body.
@@ -160,6 +240,9 @@ $body
   </soap:Body>
 </soap:Envelope>''';
 
+    final actionName = action.split('/').last;
+    _logWsd('$actionName REQUEST → ${_serviceUrl.toString()}', envelope);
+
     final client = HttpClient();
     try {
       final request = await client.postUrl(_serviceUrl);
@@ -169,8 +252,18 @@ $body
 
       if (response.statusCode < 200 || response.statusCode >= 300) {
         final errorBody = await response.transform(const SystemEncoding().decoder).join();
-        final truncated = errorBody.length > 500 ? '${errorBody.substring(0, 500)}...' : errorBody;
-        throw ScanException('HTTP ${response.statusCode}: $truncated');
+        _logWsd('$actionName FAULT (HTTP ${response.statusCode})', errorBody);
+        final subcode = _extractFaultSubcode(errorBody);
+        final reason = _extractTag(errorBody, 'Text') ?? _extractTag(errorBody, 'Reason');
+        // Prefer the parsed SOAP fault reason; fall back to the raw body so the
+        // scanner's actual complaint is visible instead of just the XML preamble.
+        final detail = reason ??
+            (errorBody.length > 1500 ? '${errorBody.substring(0, 1500)}...' : errorBody);
+        throw ScanException(
+          'HTTP ${response.statusCode}: ${subcode != null ? '[$subcode] ' : ''}$detail',
+          faultSubcode: subcode,
+          statusCode: response.statusCode,
+        );
       }
 
       if (returnRawBytes) {
@@ -213,13 +306,16 @@ $body
 
     // Verify this is actually a multipart MTOM response
     if (!contentType.toLowerCase().contains('multipart')) {
-      // Not multipart — likely a SOAP fault. Try to extract error message.
+      // Not multipart — likely a SOAP fault (e.g. the ADF feeder is now empty).
       final text = utf8.decode(bytes, allowMalformed: true);
-      final fault = _extractTag(text, 'Reason') ?? _extractTag(text, 'Fault');
+      final subcode = _extractFaultSubcode(text);
+      final fault = _extractTag(text, 'Text') ?? _extractTag(text, 'Reason') ?? _extractTag(text, 'Fault');
       throw ScanException(
         'Scanner returned non-multipart response '
         '(Content-Type: $contentType, ${bytes.length} bytes). '
+        '${subcode != null ? "[$subcode] " : ""}'
         '${fault != null ? "Fault: $fault" : "Raw: ${text.substring(0, text.length.clamp(0, 300))}"}',
+        faultSubcode: subcode,
       );
     }
 
@@ -312,6 +408,13 @@ $body
     final match = RegExp('<[^>]*$tagName[^>]*>(.*?)</[^>]*$tagName>', dotAll: true).firstMatch(xml);
     return match?.group(1)?.trim();
   }
+
+  /// Extract the SOAP fault Subcode value (e.g. `wscn:ClientErrorNoImagesAvailable`)
+  /// from a fault envelope. The subcode lives in `Subcode > Value`.
+  String? _extractFaultSubcode(String xml) {
+    final match = RegExp(r'Subcode>\s*<[^>]*Value[^>]*>(.*?)</', dotAll: true).firstMatch(xml);
+    return match?.group(1)?.trim();
+  }
 }
 
 /// Scan settings for a WSD scan job.
@@ -320,6 +423,7 @@ class ScanSettings {
   final String colorMode; // RGB24, Grayscale8, BlackAndWhite1
   final String inputSource; // Platen (flatbed), ADF (auto document feeder)
   final String format; // exif (JPEG), tiff-single-g4 (TIFF G4)
+  final bool duplex; // two-sided scanning (ADF only)
   final int widthInThousandths; // in 1/1000 inch
   final int heightInThousandths; // in 1/1000 inch
 
@@ -328,6 +432,7 @@ class ScanSettings {
     this.colorMode = 'RGB24',
     this.inputSource = 'Platen',
     this.format = 'exif',
+    this.duplex = false,
     this.widthInThousandths = 8500, // 8.5 inches (Letter/A4)
     this.heightInThousandths = 11700, // 11.7 inches (A4)
   });
@@ -337,12 +442,18 @@ class ScanSettings {
     String? colorMode,
     String? inputSource,
     String? format,
+    bool? duplex,
+    int? widthInThousandths,
+    int? heightInThousandths,
   }) {
     return ScanSettings(
       dpi: dpi ?? this.dpi,
       colorMode: colorMode ?? this.colorMode,
       inputSource: inputSource ?? this.inputSource,
       format: format ?? this.format,
+      duplex: duplex ?? this.duplex,
+      widthInThousandths: widthInThousandths ?? this.widthInThousandths,
+      heightInThousandths: heightInThousandths ?? this.heightInThousandths,
     );
   }
 }
@@ -353,6 +464,7 @@ class ScannerCapabilities {
   final List<String> supportedColorModes;
   final List<String> supportedFormats;
   final List<String> supportedInputSources;
+  final bool supportsDuplex;
   final String statusText;
 
   ScannerCapabilities({
@@ -360,6 +472,7 @@ class ScannerCapabilities {
     this.supportedColorModes = const ['RGB24', 'Grayscale8', 'BlackAndWhite1'],
     this.supportedFormats = const ['exif'],
     this.supportedInputSources = const ['Platen'],
+    this.supportsDuplex = false,
     this.statusText = 'Unknown',
   });
 
@@ -401,6 +514,12 @@ class ScannerCapabilities {
     if (xml.contains('<wscn:Platen>')) sources.add('Platen');
     if (xml.contains('<wscn:ADF>')) sources.add('ADF');
 
+    // Duplex support is advertised by the VALUE of ADFSupportsDuplex (0/1) —
+    // the element (and an ADFBack config block) is present even on simplex ADFs.
+    final duplexMatch =
+        RegExp(r'<wscn:ADFSupportsDuplex>\s*(\d)\s*</wscn:ADFSupportsDuplex>').firstMatch(xml);
+    final supportsDuplex = duplexMatch?.group(1) == '1';
+
     // Parse status
     final status = RegExp(r'<wscn:ScannerState>(.*?)</wscn:ScannerState>').firstMatch(xml)?.group(1) ?? 'Unknown';
 
@@ -409,6 +528,7 @@ class ScannerCapabilities {
       supportedColorModes: colorModes.isEmpty ? ['RGB24', 'Grayscale8'] : colorModes,
       supportedFormats: formats.isEmpty ? ['exif'] : formats,
       supportedInputSources: sources.isEmpty ? ['Platen'] : sources,
+      supportsDuplex: supportsDuplex,
       statusText: status,
     );
   }
@@ -416,7 +536,14 @@ class ScannerCapabilities {
 
 class ScanException implements Exception {
   final String message;
-  ScanException(this.message);
+
+  /// SOAP fault subcode (e.g. `wscn:ClientErrorNoImagesAvailable`), when present.
+  final String? faultSubcode;
+
+  /// HTTP status code that produced this fault, when applicable.
+  final int? statusCode;
+
+  ScanException(this.message, {this.faultSubcode, this.statusCode});
 
   @override
   String toString() => 'ScanException: $message';
